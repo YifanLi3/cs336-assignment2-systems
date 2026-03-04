@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import timeit
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 
 import cs336_basics.model as basics_model
+from cs336_basics.optimizer import AdamW
 from cs336_systems.config import (
     BATCH_SIZE,
     CONTEXT_LENGTHS,
@@ -77,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         help="Time only forward pass; if not set, time forward + backward",
     )
     p.add_argument(
+        "--training",
+        action="store_true",
+        help="Include AdamW optimizer step (full training step)",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -109,16 +116,28 @@ def run_one_step(
     x: torch.Tensor,
     y: torch.Tensor,
     forward_only: bool,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
-    """Run one forward pass, and backward if not forward_only."""
-    logits = model(x)
-    loss = F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        y.view(-1),
-        ignore_index=-1,
-    )
+    """Run one forward pass, and backward + optimizer step if not forward_only."""
+    with nvtx.range("forward"):
+        logits = model(x)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            y.view(-1),
+            ignore_index=-1,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     if not forward_only:
-        loss.backward()
+        with nvtx.range("backward"):
+            loss.backward()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+    if optimizer is not None:
+        with nvtx.range("optimizer_step"):
+            optimizer.step()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
 
 def time_steps(
@@ -129,6 +148,7 @@ def time_steps(
     warmup: int,
     steps: int,
     device: torch.device | str,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> list[float]:
     """Run warmup steps, then time `steps` steps. Returns list of timings in seconds."""
     model.train()
@@ -136,21 +156,23 @@ def time_steps(
     is_cuda = isinstance(device, torch.device) and device.type == "cuda" or device == "cuda"
 
     # Warm-up
-    for _ in range(warmup):
-        run_one_step(model, x, y, forward_only)
-        if not forward_only:
-            model.zero_grad(set_to_none=True)
-        if is_cuda:
-            torch.cuda.synchronize()
+    for i in range(warmup):
+        with nvtx.range(f"warmup_{i}"):
+            run_one_step(model, x, y, forward_only, optimizer)
+            if not forward_only:
+                model.zero_grad(set_to_none=True)
+            if is_cuda:
+                torch.cuda.synchronize()
 
     # Timed steps
-    for _ in range(steps):
+    for i in range(steps):
         if not forward_only:
             model.zero_grad(set_to_none=True)
         if is_cuda:
             torch.cuda.synchronize()
         start = timeit.default_timer()
-        run_one_step(model, x, y, forward_only)
+        with nvtx.range(f"step_{i}"):
+            run_one_step(model, x, y, forward_only, optimizer)
         if is_cuda:
             torch.cuda.synchronize()
         end = timeit.default_timer()
@@ -171,6 +193,10 @@ def main() -> None:
     model = basics_model.BasicsTransformerLM(**kwargs)
     model = model.to(device)
 
+    optimizer = None
+    if args.training:
+        optimizer = AdamW(model.parameters(), lr=1e-4)
+
     x, y = get_random_batch(
         args.batch_size,
         args.context_length,
@@ -178,7 +204,7 @@ def main() -> None:
         device,
     )
 
-    mode = "forward only" if args.forward_only else "forward + backward"
+    mode = "forward only" if args.forward_only else ("training (fwd+bwd+adamw)" if args.training else "forward + backward")
     print(f"Model: {args.size}, context_length={args.context_length}, batch_size={args.batch_size}")
     print(f"Warmup: {args.warmup} steps, timing: {args.steps} steps ({mode})")
     print(f"Device: {device}")
@@ -189,6 +215,7 @@ def main() -> None:
         warmup=args.warmup,
         steps=args.steps,
         device=device,
+        optimizer=optimizer,
     )
 
     mean_s = sum(timings) / len(timings)
