@@ -9,6 +9,8 @@ __pycache__/
 
 # C extensions
 *.so
+*.nsys-rep
+*.sqlite
 
 # Distribution / packaging
 .Python

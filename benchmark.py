@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import timeit
+from contextlib import nullcontext
+
 import torch
 import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
@@ -84,6 +86,11 @@ def parse_args() -> argparse.Namespace:
         help="Include AdamW optimizer step (full training step)",
     )
     p.add_argument(
+        "--mixed_precision",
+        action="store_true",
+        help="Enable BF16 mixed precision via torch.autocast",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -117,15 +124,18 @@ def run_one_step(
     y: torch.Tensor,
     forward_only: bool,
     optimizer: torch.optim.Optimizer | None = None,
+    autocast_ctx=None,
 ) -> None:
     """Run one forward pass, and backward + optimizer step if not forward_only."""
+    ctx = autocast_ctx if autocast_ctx is not None else nullcontext()
     with nvtx.range("forward"):
-        logits = model(x)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            y.view(-1),
-            ignore_index=-1,
-        )
+        with ctx:
+            logits = model(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
+                ignore_index=-1,
+            )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     if not forward_only:
@@ -149,6 +159,7 @@ def time_steps(
     steps: int,
     device: torch.device | str,
     optimizer: torch.optim.Optimizer | None = None,
+    autocast_ctx=None,
 ) -> list[float]:
     """Run warmup steps, then time `steps` steps. Returns list of timings in seconds."""
     model.train()
@@ -158,7 +169,7 @@ def time_steps(
     # Warm-up
     for i in range(warmup):
         with nvtx.range(f"warmup_{i}"):
-            run_one_step(model, x, y, forward_only, optimizer)
+            run_one_step(model, x, y, forward_only, optimizer, autocast_ctx)
             if not forward_only:
                 model.zero_grad(set_to_none=True)
             if is_cuda:
@@ -172,7 +183,7 @@ def time_steps(
             torch.cuda.synchronize()
         start = timeit.default_timer()
         with nvtx.range(f"step_{i}"):
-            run_one_step(model, x, y, forward_only, optimizer)
+            run_one_step(model, x, y, forward_only, optimizer, autocast_ctx)
         if is_cuda:
             torch.cuda.synchronize()
         end = timeit.default_timer()
@@ -193,6 +204,10 @@ def main() -> None:
     model = basics_model.BasicsTransformerLM(**kwargs)
     model = model.to(device)
 
+    autocast_ctx = None
+    if args.mixed_precision:
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+
     optimizer = None
     if args.training:
         optimizer = AdamW(model.parameters(), lr=1e-4)
@@ -204,8 +219,10 @@ def main() -> None:
         device,
     )
 
+    precision = "BF16 mixed" if args.mixed_precision else "FP32"
     mode = "forward only" if args.forward_only else ("training (fwd+bwd+adamw)" if args.training else "forward + backward")
     print(f"Model: {args.size}, context_length={args.context_length}, batch_size={args.batch_size}")
+    print(f"Precision: {precision}")
     print(f"Warmup: {args.warmup} steps, timing: {args.steps} steps ({mode})")
     print(f"Device: {device}")
 
@@ -216,6 +233,7 @@ def main() -> None:
         steps=args.steps,
         device=device,
         optimizer=optimizer,
+        autocast_ctx=autocast_ctx,
     )
 
     mean_s = sum(timings) / len(timings)
