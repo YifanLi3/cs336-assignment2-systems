@@ -91,6 +91,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable BF16 mixed precision via torch.autocast",
     )
     p.add_argument(
+        "--profiling_memory",
+        action="store_true",
+        help="Enable profiling memory"
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -128,6 +133,7 @@ def run_one_step(
 ) -> None:
     """Run one forward pass, and backward + optimizer step if not forward_only."""
     ctx = autocast_ctx if autocast_ctx is not None else nullcontext()
+
     with nvtx.range("forward"):
         with ctx:
             logits = model(x)
@@ -226,6 +232,9 @@ def main() -> None:
     print(f"Warmup: {args.warmup} steps, timing: {args.steps} steps ({mode})")
     print(f"Device: {device}")
 
+    if args.profiling_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     timings = time_steps(
         model, x, y,
         forward_only=args.forward_only,
@@ -235,6 +244,11 @@ def main() -> None:
         optimizer=optimizer,
         autocast_ctx=autocast_ctx,
     )
+
+    if args.profiling_memory:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print("Memory snapshot saved to memory_snapshot.pickle")
 
     mean_s = sum(timings) / len(timings)
     variance = sum((t - mean_s) ** 2 for t in timings) / len(timings)
