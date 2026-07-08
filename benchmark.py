@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable profiling memory"
     )
     p.add_argument(
+        "--compile",
+        dest="compile",
+        action="store_true",
+        help="Wrap the model in torch.compile before benchmarking",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -210,6 +216,10 @@ def main() -> None:
     model = basics_model.BasicsTransformerLM(**kwargs)
     model = model.to(device)
 
+    if args.compile:
+        # NOTE: build optimizer BEFORE compile so it holds refs to the original
+        # parameter tensors (torch.compile wraps the module but keeps params).
+        pass
     autocast_ctx = None
     if args.mixed_precision:
         autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
@@ -217,6 +227,9 @@ def main() -> None:
     optimizer = None
     if args.training:
         optimizer = AdamW(model.parameters(), lr=1e-4)
+
+    if args.compile:
+        model = torch.compile(model)
 
     x, y = get_random_batch(
         args.batch_size,
@@ -227,8 +240,9 @@ def main() -> None:
 
     precision = "BF16 mixed" if args.mixed_precision else "FP32"
     mode = "forward only" if args.forward_only else ("training (fwd+bwd+adamw)" if args.training else "forward + backward")
+    compile_str = "torch.compile" if args.compile else "eager"
     print(f"Model: {args.size}, context_length={args.context_length}, batch_size={args.batch_size}")
-    print(f"Precision: {precision}")
+    print(f"Precision: {precision} | Compile: {compile_str}")
     print(f"Warmup: {args.warmup} steps, timing: {args.steps} steps ({mode})")
     print(f"Device: {device}")
 
